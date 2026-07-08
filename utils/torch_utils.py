@@ -203,10 +203,16 @@ def mem_report():
     print('='*LEN)
 
 def grad_norm(params):
-    grad_norm = 0.
+    grad_norm = None
     for p in params:
         if p.grad is not None:
-            grad_norm += torch.sum(p.grad ** 2)
+            grad = p.grad
+            if bool(torch.isfinite(grad).all()):
+                grad = grad.to(dtype=torch.float64)
+            term = torch.sum(grad ** 2)
+            grad_norm = term if grad_norm is None else grad_norm + term
+    if grad_norm is None:
+        return torch.tensor(0.0)
     return torch.sqrt(grad_norm)
 
 def print_leaf_nodes(grad_fn, id_set):

@@ -9,7 +9,10 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from models import model_utils
+try:
+    from diffrl.models import model_utils
+except ImportError:  # pragma: no cover - legacy direct-script execution
+    from models import model_utils
 
 
 class CriticMLP(nn.Module):

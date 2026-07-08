@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffrl"
+version = "0.1.0+acelab"
+description = "ACELab-adapted DiffRL SHAC implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "torch",
+  "PyYAML",
+  "tensorboardX",
+]
+
+[tool.setuptools]
+package-dir = { "diffrl" = "." }
+packages = [
+  "diffrl",
+  "diffrl.algorithms",
+  "diffrl.envs",
+  "diffrl.models",
+  "diffrl.utils",
+]

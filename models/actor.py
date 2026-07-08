@@ -10,7 +10,10 @@ import torch.nn as nn
 from torch.distributions.normal import Normal
 import numpy as np
 
-from models import model_utils
+try:
+    from diffrl.models import model_utils
+except ImportError:  # pragma: no cover - legacy direct-script execution
+    from models import model_utils
 
 
 class ActorDeterministicMLP(nn.Module):
@@ -31,10 +34,34 @@ class ActorDeterministicMLP(nn.Module):
                 modules.append(model_utils.get_activation_func(cfg_network['actor_mlp']['activation']))
                 modules.append(torch.nn.LayerNorm(self.layer_dims[i+1]))
 
-        self.actor = nn.Sequential(*modules).to(device)
-        
         self.action_dim = action_dim
         self.obs_dim = obs_dim
+        self.actor = nn.Sequential(*modules).to(device)
+        bias_init = cfg_network.get("actor_output_bias_init")
+        weight_scale = cfg_network.get("actor_output_weight_init_scale")
+        if bias_init is not None or weight_scale is not None:
+            output_layer = None
+            for module in reversed(self.actor):
+                if isinstance(module, nn.Linear):
+                    output_layer = module
+                    break
+            if output_layer is None:
+                raise RuntimeError("ActorDeterministicMLP has no Linear output layer to initialize.")
+            if weight_scale is not None:
+                with torch.no_grad():
+                    output_layer.weight.mul_(float(weight_scale))
+            if bias_init is not None:
+                if isinstance(bias_init, (float, int)):
+                    bias_tensor = torch.full((self.action_dim,), float(bias_init), dtype=torch.float32, device=self.device)
+                else:
+                    bias_tensor = torch.as_tensor(bias_init, dtype=torch.float32, device=self.device)
+                    if tuple(bias_tensor.shape) != (self.action_dim,):
+                        raise ValueError(
+                            f"actor_output_bias_init shape mismatch: expected {(self.action_dim,)}, "
+                            f"got {tuple(bias_tensor.shape)}."
+                        )
+                with torch.no_grad():
+                    output_layer.bias.copy_(bias_tensor)
 
         print(self.actor)
 

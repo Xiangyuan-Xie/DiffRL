@@ -6,7 +6,10 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import time
-from utils.common import *
+try:
+    from diffrl.utils.common import *
+except ImportError:  # pragma: no cover - legacy direct-script execution
+    from utils.common import *
 
 class Timer:
     def __init__(self, name):
