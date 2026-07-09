@@ -9,6 +9,22 @@ from diffrl.algorithms.shac import SHAC
 from diffrl.envs.dummy_differentiable import DummyDifferentiableVecEnv
 
 
+class RecordingWriter:
+    def __init__(self):
+        self.scalars = []
+        self.flushed = False
+        self.closed = False
+
+    def add_scalar(self, tag, value, step):
+        self.scalars.append((tag, value, step))
+
+    def flush(self):
+        self.flushed = True
+
+    def close(self):
+        self.closed = True
+
+
 def _cfg(logdir: Path) -> dict:
     return {
         "params": {
@@ -102,6 +118,173 @@ def test_shac_logging_uses_finite_placeholders_when_no_episode_finished(tmp_path
     assert not any("inf" in line or "nan" in line for line in iter_lines)
 
 
+def test_shac_tensorboard_logging_matches_original_diffrl_tags_without_debug_tags(tmp_path):
+    cfg = _cfg(tmp_path)
+    cfg["params"]["config"]["max_epochs"] = 1
+    cfg["params"]["config"]["steps_num"] = 1
+    cfg["params"]["config"]["save_interval"] = 0
+    env = DummyDifferentiableVecEnv(num_envs=8, episode_length=1, device="cpu")
+    alg = SHAC(cfg, env=env)
+    writer = RecordingWriter()
+    alg.writer = writer
+
+    alg.train()
+
+    tags = {tag for tag, _value, _step in writer.scalars}
+    expected_original_tags = {
+        "lr/iter",
+        "actor_loss/step",
+        "actor_loss/iter",
+        "value_loss/step",
+        "value_loss/iter",
+        "policy_loss/step",
+        "policy_loss/time",
+        "policy_loss/iter",
+        "rewards/step",
+        "rewards/time",
+        "rewards/iter",
+        "policy_discounted_loss/step",
+        "policy_discounted_loss/iter",
+        "best_policy_loss/step",
+        "best_policy_loss/iter",
+        "episode_lengths/iter",
+        "episode_lengths/step",
+        "episode_lengths/time",
+    }
+    assert expected_original_tags <= tags
+    assert not any(tag.startswith("actor_grad_norm/") for tag in tags)
+    assert not any(tag.startswith("memory/") for tag in tags)
+
+
+def test_shac_tensorboard_logs_episode_extras_like_rsl_rl(tmp_path):
+    class EpisodeExtrasEnv(DummyDifferentiableVecEnv):
+        def step(self, actions):
+            obs, reward, done, extras = super().step(actions)
+            extras = dict(extras)
+            extras["log"] = {
+                "Episode_Reward/pos": torch.tensor([1.0, 3.0]),
+                "Episode_Reward/att": 2.0,
+                "Episode_Termination/time_out": torch.tensor(1.0),
+                "curriculum_level": torch.tensor([4.0]),
+                "debug_text": "ignored",
+            }
+            return obs, reward, done, extras
+
+    cfg = _cfg(tmp_path)
+    cfg["params"]["config"]["max_epochs"] = 1
+    cfg["params"]["config"]["steps_num"] = 1
+    cfg["params"]["config"]["save_interval"] = 0
+    env = EpisodeExtrasEnv(num_envs=8, episode_length=1, device="cpu")
+    alg = SHAC(cfg, env=env)
+    writer = RecordingWriter()
+    alg.writer = writer
+
+    alg.train()
+
+    scalar_by_tag = {tag: (value, step) for tag, value, step in writer.scalars}
+    assert "Episode_Reward/pos" in scalar_by_tag
+    assert "Episode_Reward/att" in scalar_by_tag
+    assert "Episode_Termination/time_out" in scalar_by_tag
+    assert "Episode/curriculum_level" in scalar_by_tag
+    assert "debug_text" not in scalar_by_tag
+    assert torch.as_tensor(scalar_by_tag["Episode_Reward/pos"][0]).item() == pytest.approx(2.0)
+    assert torch.as_tensor(scalar_by_tag["Episode_Reward/att"][0]).item() == pytest.approx(2.0)
+    assert torch.as_tensor(scalar_by_tag["Episode_Termination/time_out"][0]).item() == pytest.approx(1.0)
+    assert torch.as_tensor(scalar_by_tag["Episode/curriculum_level"][0]).item() == pytest.approx(4.0)
+    assert scalar_by_tag["Episode_Reward/pos"][1] == alg.iter_count
+    assert scalar_by_tag["Episode_Reward/att"][1] == alg.iter_count
+    assert scalar_by_tag["Episode_Termination/time_out"][1] == alg.iter_count
+    assert scalar_by_tag["Episode/curriculum_level"][1] == alg.iter_count
+
+
+def test_shac_tensorboard_prefers_episode_extras_over_log_like_rsl_rl(tmp_path):
+    class EpisodePreferredExtrasEnv(DummyDifferentiableVecEnv):
+        def step(self, actions):
+            obs, reward, done, extras = super().step(actions)
+            extras = dict(extras)
+            extras["episode"] = {"manager_metric": torch.tensor(5.0)}
+            extras["log"] = {"manager_metric": torch.tensor(1.0)}
+            return obs, reward, done, extras
+
+    cfg = _cfg(tmp_path)
+    cfg["params"]["config"]["max_epochs"] = 1
+    cfg["params"]["config"]["steps_num"] = 1
+    cfg["params"]["config"]["save_interval"] = 0
+    env = EpisodePreferredExtrasEnv(num_envs=8, episode_length=1, device="cpu")
+    alg = SHAC(cfg, env=env)
+    writer = RecordingWriter()
+    alg.writer = writer
+
+    alg.train()
+
+    scalar_by_tag = {tag: (value, step) for tag, value, step in writer.scalars}
+    assert "Episode/manager_metric" in scalar_by_tag
+    assert torch.as_tensor(scalar_by_tag["Episode/manager_metric"][0]).item() == pytest.approx(5.0)
+
+
+def test_shac_tensorboard_ignores_stale_episode_log_when_no_env_done(tmp_path):
+    class StaleResetLogEnv(DummyDifferentiableVecEnv):
+        def step(self, actions):
+            obs, reward, done, extras = super().step(actions)
+            extras = dict(extras)
+            done = torch.zeros_like(done, dtype=torch.bool)
+            extras["log"] = {
+                "Episode_Reward/pos": torch.tensor(0.0),
+                "Episode_Termination/time_out": torch.tensor(0.0),
+            }
+            return obs, reward, done, extras
+
+    cfg = _cfg(tmp_path)
+    cfg["params"]["config"]["steps_num"] = 1
+    env = StaleResetLogEnv(num_envs=8, episode_length=128, device="cpu")
+    alg = SHAC(cfg, env=env)
+    writer = RecordingWriter()
+    alg.writer = writer
+
+    loss = alg.compute_actor_loss()
+    assert torch.isfinite(loss)
+    alg._log_episode_extra_scalars()
+
+    tags = {tag for tag, _value, _step in writer.scalars}
+    assert "Episode_Reward/pos" not in tags
+    assert "Episode_Termination/time_out" not in tags
+
+
+def test_shac_target_critic_keeps_input_gradient_without_parameter_gradients(tmp_path):
+    env = DummyDifferentiableVecEnv(num_envs=4, episode_length=16, device="cpu")
+    alg = SHAC(_cfg(tmp_path), env=env)
+
+    assert all(not parameter.requires_grad for parameter in alg.target_critic.parameters())
+
+    obs = torch.randn(4, alg.num_obs, requires_grad=True)
+    value = alg.target_critic(obs).sum()
+    obs_grad = torch.autograd.grad(value, obs)[0]
+
+    assert torch.isfinite(obs_grad).all()
+    assert torch.linalg.vector_norm(obs_grad) > 0
+    assert all(parameter.grad is None for parameter in alg.target_critic.parameters())
+
+
+def test_shac_clears_rollout_graph_after_actor_update(tmp_path):
+    class CleanupEnv(DummyDifferentiableVecEnv):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.cleanup_calls = 0
+
+        def clear_rollout_graph_after_update(self):
+            self.cleanup_calls += 1
+            self.clear_grad()
+
+    cfg = _cfg(tmp_path)
+    cfg["params"]["config"]["max_epochs"] = 2
+    env = CleanupEnv(num_envs=8, episode_length=16, device="cpu")
+
+    alg = SHAC(cfg, env=env)
+    alg.train()
+
+    assert env.cleanup_calls == cfg["params"]["config"]["max_epochs"]
+
+
 def test_shac_can_disable_actor_loss_critic_bootstrap(tmp_path):
     class ZeroRewardActionStateEnv:
         num_envs = 4
@@ -155,6 +338,175 @@ def test_shac_can_disable_actor_loss_critic_bootstrap(tmp_path):
 
     assert torch.isfinite(grad_norm)
     assert grad_norm == 0.0
+
+
+def test_shac_actor_loss_critic_bootstrap_warmup_defers_target_critic_gradients(tmp_path):
+    class ZeroRewardActionStateEnv:
+        num_envs = 4
+        num_obs = 1
+        num_actions = 1
+        episode_length = 4
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.reset()
+
+        def clear_grad(self):
+            pass
+
+        def reset(self):
+            self._step = 0
+            self.state = torch.zeros(self.num_envs, self.num_obs)
+            return self.state
+
+        def initialize_trajectory(self):
+            return self.reset()
+
+        def step(self, actions):
+            self._step += 1
+            next_state = actions[:, :1]
+            reward = actions[:, 0] * 0.0
+            done = torch.zeros(self.num_envs, dtype=torch.bool)
+            return next_state, reward, done, {"obs_before_reset": next_state}
+
+    cfg = _cfg(tmp_path)
+    cfg["params"]["diff_env"]["episode_length"] = 4
+    cfg["params"]["network"]["actor"] = "ActorDeterministicMLP"
+    cfg["params"]["network"]["actor_mlp"] = {"units": [4], "activation": "elu"}
+    cfg["params"]["network"]["actor_output_bias_init"] = 0.25
+    cfg["params"]["network"]["actor_output_weight_init_scale"] = 0.0
+    cfg["params"]["config"]["num_actors"] = 4
+    cfg["params"]["config"]["steps_num"] = 1
+    cfg["params"]["config"]["actor_loss_critic_bootstrap"] = True
+    cfg["params"]["config"]["actor_loss_critic_bootstrap_warmup_epochs"] = 2
+
+    alg = SHAC(cfg, env=ZeroRewardActionStateEnv())
+    alg.target_critic = torch.nn.Linear(1, 1, bias=False)
+    alg.target_critic.requires_grad_(False)
+    with torch.no_grad():
+        alg.target_critic.weight.fill_(1.0)
+
+    loss = alg.compute_actor_loss()
+    alg.actor_optimizer.zero_grad()
+    loss.backward()
+    warmup_grad_norm = torch.linalg.vector_norm(
+        torch.stack([p.grad.norm() for p in alg.actor.parameters() if p.grad is not None])
+    )
+
+    alg.iter_count = 2
+    loss = alg.compute_actor_loss()
+    alg.actor_optimizer.zero_grad()
+    loss.backward()
+    active_grad_norm = torch.linalg.vector_norm(
+        torch.stack([p.grad.norm() for p in alg.actor.parameters() if p.grad is not None])
+    )
+
+    assert torch.isfinite(warmup_grad_norm)
+    assert warmup_grad_norm == 0.0
+    assert torch.isfinite(active_grad_norm)
+    assert active_grad_norm > 0.0
+
+
+def test_shac_contract_uses_tanh_actions_and_obs_before_reset_for_timeout_bootstrap(tmp_path):
+    class TimeoutBootstrapEnv:
+        num_envs = 2
+        num_obs = 1
+        num_actions = 1
+        episode_length = 1
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.received_actions = None
+
+        def clear_grad(self):
+            pass
+
+        def reset(self):
+            return torch.zeros(self.num_envs, self.num_obs)
+
+        def initialize_trajectory(self):
+            return self.reset()
+
+        def step(self, actions):
+            self.received_actions = actions
+            next_state = actions[:, :1] + 1.0
+            done = torch.tensor([True, False])
+            reward = torch.zeros(self.num_envs)
+            obs_before_reset = next_state + torch.tensor([[2.0], [9.0]])
+            return next_state, reward, done, {"obs_before_reset": obs_before_reset}
+
+    cfg = _cfg(tmp_path)
+    cfg["params"]["diff_env"]["episode_length"] = 1
+    cfg["params"]["network"]["actor"] = "ActorDeterministicMLP"
+    cfg["params"]["network"]["actor_mlp"] = {"units": [4], "activation": "elu"}
+    cfg["params"]["network"]["actor_output_bias_init"] = 0.4
+    cfg["params"]["network"]["actor_output_weight_init_scale"] = 0.0
+    cfg["params"]["config"]["num_actors"] = 2
+    cfg["params"]["config"]["steps_num"] = 1
+
+    env = TimeoutBootstrapEnv()
+    alg = SHAC(cfg, env=env)
+    alg.target_critic = torch.nn.Linear(1, 1, bias=False)
+    alg.target_critic.requires_grad_(False)
+    with torch.no_grad():
+        alg.target_critic.weight.fill_(1.0)
+
+    loss = alg.compute_actor_loss()
+
+    actor_action = torch.tanh(torch.tensor(0.4))
+    assert env.received_actions is not None
+    assert torch.allclose(env.received_actions, torch.full((2, 1), actor_action))
+    expected_timeout_value = actor_action + 3.0
+    expected_non_done_value = actor_action + 1.0
+    expected_loss = -alg.gamma * (expected_timeout_value + expected_non_done_value) / env.num_envs
+    assert torch.allclose(loss, expected_loss)
+
+
+def test_shac_contract_zeros_critic_bootstrap_for_early_termination(tmp_path):
+    class EarlyTerminationEnv:
+        num_envs = 2
+        num_obs = 1
+        num_actions = 1
+        episode_length = 4
+        device = torch.device("cpu")
+
+        def clear_grad(self):
+            pass
+
+        def reset(self):
+            return torch.zeros(self.num_envs, self.num_obs)
+
+        def initialize_trajectory(self):
+            return self.reset()
+
+        def step(self, actions):
+            next_state = actions[:, :1] + 1.0
+            done = torch.tensor([True, False])
+            reward = torch.zeros(self.num_envs)
+            obs_before_reset = next_state + 100.0
+            return next_state, reward, done, {"obs_before_reset": obs_before_reset}
+
+    cfg = _cfg(tmp_path)
+    cfg["params"]["diff_env"]["episode_length"] = 4
+    cfg["params"]["network"]["actor"] = "ActorDeterministicMLP"
+    cfg["params"]["network"]["actor_mlp"] = {"units": [4], "activation": "elu"}
+    cfg["params"]["network"]["actor_output_bias_init"] = 0.4
+    cfg["params"]["network"]["actor_output_weight_init_scale"] = 0.0
+    cfg["params"]["config"]["num_actors"] = 2
+    cfg["params"]["config"]["steps_num"] = 1
+
+    alg = SHAC(cfg, env=EarlyTerminationEnv())
+    alg.target_critic = torch.nn.Linear(1, 1, bias=False)
+    alg.target_critic.requires_grad_(False)
+    with torch.no_grad():
+        alg.target_critic.weight.fill_(1.0)
+
+    loss = alg.compute_actor_loss()
+
+    actor_action = torch.tanh(torch.tensor(0.4))
+    expected_non_done_value = actor_action + 1.0
+    expected_loss = -alg.gamma * expected_non_done_value / 2
+    assert torch.allclose(loss, expected_loss)
 
 
 def test_shac_accumulates_termination_reason_counts_from_extras(tmp_path):
@@ -408,13 +760,13 @@ def test_shac_clips_extreme_finite_actor_gradients_before_norm_overflow(tmp_path
     assert torch.isfinite(alg.grad_norm_after_clip)
 
 
-def test_shac_preprocesses_extreme_observations_without_cutting_gradients(tmp_path):
+def test_shac_clips_finite_extreme_observations_without_cutting_gradients(tmp_path):
     env = DummyDifferentiableVecEnv(num_envs=4, episode_length=16, device="cpu")
     cfg = _cfg(tmp_path)
     cfg["params"]["config"]["obs_clip"] = 10.0
     alg = SHAC(cfg, env=env)
     obs = torch.tensor(
-        [[float("nan"), float("inf")], [1.0e6, -1.0e6], [1.0, -2.0], [0.0, 3.0]],
+        [[1.0e6, -1.0e6], [20.0, -20.0], [1.0, -2.0], [0.0, 3.0]],
         dtype=torch.float32,
         requires_grad=True,
     )
@@ -425,11 +777,25 @@ def test_shac_preprocesses_extreme_observations_without_cutting_gradients(tmp_pa
 
     assert torch.isfinite(processed).all()
     assert processed.abs().max() <= 10.0
-    assert torch.allclose(processed[0], torch.zeros_like(processed[0]))
     assert torch.allclose(grad[-1], torch.ones_like(grad[-1]))
 
 
-def test_shac_sanitizes_nonfinite_actor_gradients_before_clipping(tmp_path):
+def test_shac_rejects_nonfinite_observations_instead_of_sanitizing(tmp_path):
+    env = DummyDifferentiableVecEnv(num_envs=4, episode_length=16, device="cpu")
+    cfg = _cfg(tmp_path)
+    cfg["params"]["config"]["obs_clip"] = 10.0
+    alg = SHAC(cfg, env=env)
+    obs = torch.tensor(
+        [[float("nan"), float("inf")], [1.0e6, -1.0e6], [1.0, -2.0], [0.0, 3.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    with pytest.raises(RuntimeError, match="observation contains non-finite"):
+        alg._preprocess_obs(obs)
+
+
+def test_shac_rejects_nonfinite_actor_gradients_before_clipping(tmp_path):
     class NonFiniteGradientEnv:
         num_envs = 4
         num_obs = 1
@@ -475,9 +841,9 @@ def test_shac_sanitizes_nonfinite_actor_gradients_before_clipping(tmp_path):
 
     alg = SHAC(cfg, env=NonFiniteGradientEnv())
 
-    alg.train()
+    with pytest.raises(RuntimeError, match="non-finite gradients"):
+        alg.train()
 
     assert alg.actor_raw_grad_profile["nonfinite_count"] > 0
     assert alg.actor_raw_grad_profile["finite_count"] == 0
-    assert torch.isfinite(alg.grad_norm_before_clip)
-    assert alg.grad_norm_before_clip == 0.0
+    assert not (tmp_path / "final_policy.pt").exists()

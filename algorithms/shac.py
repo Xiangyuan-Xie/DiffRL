@@ -224,6 +224,9 @@ class SHAC:
         
         self.target_critic_alpha = cfg['params']['config'].get('target_critic_alpha', 0.4)
         self.actor_loss_critic_bootstrap = cfg['params']['config'].get('actor_loss_critic_bootstrap', True)
+        self.actor_loss_critic_bootstrap_warmup_epochs = int(
+            cfg['params']['config'].get('actor_loss_critic_bootstrap_warmup_epochs', 0)
+        )
         self.obs_clip = cfg['params']['config'].get('obs_clip', None)
 
         self.obs_rms = None
@@ -280,6 +283,7 @@ class SHAC:
         self.critic = critic_fn(self.num_obs, cfg['params']['network'], device = self.device)
         self.all_params = list(self.actor.parameters()) + list(self.critic.parameters())
         self.target_critic = copy.deepcopy(self.critic)
+        self.target_critic.requires_grad_(False)
     
         if cfg['params']['general']['train']:
             self.save('init_policy')
@@ -318,6 +322,7 @@ class SHAC:
         self.termination_done_count = 0
         self.termination_unmatched_done_count = 0
         self.rollout_invalid_counts = {}
+        self.episode_extra_log_scalars = {}
         self.actor_action_profile = {"count": 0, "min": 0.0, "max": 0.0, "mean": 0.0}
         self.best_policy_loss = np.inf
         self.actor_loss = np.inf
@@ -345,6 +350,44 @@ class SHAC:
         if self.obs_clip is not None:
             obs = torch.clamp(obs, -float(self.obs_clip), float(self.obs_clip))
         return obs
+
+    def _reset_episode_extra_logs(self):
+        self.episode_extra_log_scalars = {}
+
+    def _collect_episode_extra_logs(self, extra_info, done):
+        if not isinstance(extra_info, dict):
+            return
+        if torch.is_tensor(done):
+            done_tensor = done.to(device=self.device, dtype=torch.bool)
+        else:
+            done_tensor = torch.as_tensor(done, device=self.device, dtype=torch.bool)
+        if done_tensor.numel() == 0 or not bool(done_tensor.any()):
+            return
+        log_info = extra_info.get("episode")
+        if not isinstance(log_info, dict):
+            log_info = extra_info.get("log")
+        if not isinstance(log_info, dict):
+            return
+        for key, value in log_info.items():
+            if not isinstance(key, str):
+                continue
+            try:
+                tensor = torch.as_tensor(value, dtype=torch.float32, device=self.device)
+            except (TypeError, ValueError):
+                continue
+            if tensor.numel() == 0:
+                continue
+            if not bool(torch.isfinite(tensor).all()):
+                raise RuntimeError(f"SHAC episode log '{key}' contains non-finite values.")
+            tag = key if "/" in key else f"Episode/{key}"
+            self.episode_extra_log_scalars.setdefault(tag, []).append(tensor.detach().mean())
+
+    def _log_episode_extra_scalars(self):
+        for key, values in sorted(self.episode_extra_log_scalars.items()):
+            if not values:
+                continue
+            value = torch.stack([item.to(self.device) for item in values]).mean()
+            self.writer.add_scalar(key, value, self.iter_count)
         
     def compute_actor_loss(self, deterministic = False):
         rew_acc = torch.zeros((self.steps_num + 1, self.num_envs), dtype = torch.float32, device = self.device)
@@ -352,6 +395,7 @@ class SHAC:
         next_values = torch.zeros((self.steps_num + 1, self.num_envs), dtype = torch.float32, device = self.device)
         
         actor_loss = torch.tensor(0., dtype = torch.float32, device = self.device)
+        self._reset_episode_extra_logs()
 
         with torch.no_grad():
             if self.obs_rms is not None:
@@ -359,6 +403,8 @@ class SHAC:
                 
             if self.ret_rms is not None:
                 ret_var = self.ret_rms.var.clone()
+
+        use_critic_bootstrap = self._use_actor_loss_critic_bootstrap()
 
         # initialize trajectory to cut off gradients between episodes.
         obs = self.env.initialize_trajectory()
@@ -405,6 +451,7 @@ class SHAC:
                     ),
                 }
             obs, rew, done, extra_info = self.env.step(actor_actions)
+            self._collect_episode_extra_logs(extra_info, done)
             if isinstance(extra_info, dict):
                 invalid_envs = extra_info.get("rollout_invalid_envs")
                 if torch.is_tensor(invalid_envs):
@@ -501,13 +548,13 @@ class SHAC:
 
             if i < self.steps_num - 1:
                 done_loss = -rew_acc[i + 1, done_env_ids]
-                if self.actor_loss_critic_bootstrap:
+                if use_critic_bootstrap:
                     done_loss = done_loss - self.gamma * gamma[done_env_ids] * next_values[i + 1, done_env_ids]
                 actor_loss = actor_loss + done_loss.sum()
             else:
                 # terminate all envs at the end of optimization iteration
                 terminal_loss = -rew_acc[i + 1, :]
-                if self.actor_loss_critic_bootstrap:
+                if use_critic_bootstrap:
                     terminal_loss = terminal_loss - self.gamma * gamma * next_values[i + 1, :]
                 actor_loss = actor_loss + terminal_loss.sum()
         
@@ -561,6 +608,11 @@ class SHAC:
         self.step_count += self.steps_num * self.num_envs
 
         return actor_loss
+
+    def _use_actor_loss_critic_bootstrap(self) -> bool:
+        if not self.actor_loss_critic_bootstrap:
+            return False
+        return int(getattr(self, "iter_count", 0)) >= self.actor_loss_critic_bootstrap_warmup_epochs
     
     @torch.no_grad()
     def evaluate_policy(self, num_games, deterministic = False):
@@ -754,6 +806,9 @@ class SHAC:
             self.time_report.start_timer("actor training")
             self.actor_optimizer.step(actor_closure).detach().item()
             self.time_report.end_timer("actor training")
+            cleanup_rollout = getattr(self.env, "clear_rollout_graph_after_update", None)
+            if callable(cleanup_rollout):
+                cleanup_rollout()
 
             # train critic
             # prepare dataset
@@ -801,6 +856,7 @@ class SHAC:
             self.writer.add_scalar('actor_loss/iter', self.actor_loss, self.iter_count)
             self.writer.add_scalar('value_loss/step', self.value_loss, self.step_count)
             self.writer.add_scalar('value_loss/iter', self.value_loss, self.iter_count)
+            self._log_episode_extra_scalars()
             has_episode_stats = len(self.episode_loss_his) > 0
             if has_episode_stats:
                 mean_episode_length = self.episode_length_meter.get_mean()
@@ -830,8 +886,8 @@ class SHAC:
                 mean_policy_discounted_loss = 0.0
                 mean_episode_length = 0.0
             
-            print('iter {}: ep loss {:.2f}, ep discounted loss {:.2f}, ep len {:.1f}, fps total {:.2f}, value loss {:.2f}, grad norm before clip {:.2f}, grad norm after clip {:.2f}'.format(\
-                    self.iter_count, mean_policy_loss, mean_policy_discounted_loss, mean_episode_length, self.steps_num * self.num_envs / (time_end_epoch - time_start_epoch), self.value_loss, self.grad_norm_before_clip, self.grad_norm_after_clip))
+            print('iter {}: actor loss {:.6g}, ep loss {:.2f}, ep discounted loss {:.2f}, ep len {:.1f}, fps total {:.2f}, value loss {:.6g}, grad norm before clip {:.3e}, grad norm after clip {:.3e}'.format(\
+                    self.iter_count, self.actor_loss, mean_policy_loss, mean_policy_discounted_loss, mean_episode_length, self.steps_num * self.num_envs / (time_end_epoch - time_start_epoch), self.value_loss, float(self.grad_norm_before_clip), float(self.grad_norm_after_clip)))
             if os.environ.get("ACELAB_SHAC_DEBUG_DONE_REASONS") == "1" and self.termination_reason_counts:
                 reasons = ", ".join(
                     f"{name}={count}" for name, count in sorted(self.termination_reason_counts.items())
@@ -865,6 +921,7 @@ class SHAC:
                 for param, param_targ in zip(self.critic.parameters(), self.target_critic.parameters()):
                     param_targ.data.mul_(alpha)
                     param_targ.data.add_((1. - alpha) * param.data)
+                self.target_critic.requires_grad_(False)
 
         self.time_report.end_timer("algorithm")
 
@@ -914,6 +971,7 @@ class SHAC:
             self.actor.load_state_dict(checkpoint["actor"])
             self.critic.load_state_dict(checkpoint["critic"])
             self.target_critic.load_state_dict(checkpoint["target_critic"])
+            self.target_critic.requires_grad_(False)
             self.obs_rms = checkpoint.get("obs_rms")
             self.ret_rms = checkpoint.get("ret_rms")
             self.iter_count = checkpoint.get("iter_count", self.iter_count)
@@ -923,6 +981,7 @@ class SHAC:
             self.actor = checkpoint[0].to(self.device)
             self.critic = checkpoint[1].to(self.device)
             self.target_critic = checkpoint[2].to(self.device)
+            self.target_critic.requires_grad_(False)
             self.obs_rms = checkpoint[3].to(self.device) if checkpoint[3] is not None else checkpoint[3]
             self.ret_rms = checkpoint[4].to(self.device) if checkpoint[4] is not None else checkpoint[4]
 
