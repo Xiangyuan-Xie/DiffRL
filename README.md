@@ -2,9 +2,21 @@
 
 This repository contains the implementation for the paper [Accelerated Policy Learning with Parallel Differentiable Simulation](https://short-horizon-actor-critic.github.io/) (ICLR 2022).
 
+The `acelab` branch also provides `diffrl.jax_shac`, a JAX adaptation for
+MuJoCo Playground/MJX environments. Install only the backend required by the
+caller:
+
+```bash
+pip install -e ".[torch]"  # Original Torch/dflex integration
+pip install -e ".[jax]"    # MJX/JAX integration
+```
+
+Both implementations remain subject to the NVIDIA Source Code License in
+`LICENSE.md` and are limited to non-commercial research and evaluation.
 
 
-In this paper, we present a GPU-based differentiable simulation and propose a policy learning method named SHAC leveraging the developed differentiable simulation. We provide a comprehensive benchmark set for policy learning with differentiable simulation. The benchmark set contains six robotic control problems for now as shown in the figure below. 
+
+In this paper, we present a GPU-based differentiable simulation and propose a policy learning method named SHAC leveraging the developed differentiable simulation. We provide a comprehensive benchmark set for policy learning with differentiable simulation. The benchmark set contains six robotic control problems for now as shown in the figure below.
 
 <p align="center">
     <img src="figures/envs.png" alt="envs" width="800" />
@@ -14,7 +26,7 @@ In this paper, we present a GPU-based differentiable simulation and propose a po
 
 - `git clone https://github.com/NVlabs/DiffRL.git --recursive`
 
-- The code has been tested on 
+- The code has been tested on
   - Operating System: Ubuntu 16.04, 18.04, 20.04, 21.10, 22.04
   - Python Version: 3.7, 3.8
   - GPU: TITAN X, RTX 1080, RTX 2080, RTX 3080, RTX 3090, RTX 3090 Ti

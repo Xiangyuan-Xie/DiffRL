@@ -6,5 +6,4 @@ new integrations can import ``diffrl.algorithms`` while legacy scripts can
 continue to run from the checkout.
 """
 
-__all__ = ["algorithms", "models", "utils"]
-
+__all__ = ["algorithms", "jax_shac", "models", "utils"]
