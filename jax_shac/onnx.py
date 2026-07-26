@@ -16,8 +16,8 @@ def export_actor_onnx(checkpoint, output):
 
     params, metadata = load_actor_checkpoint(checkpoint)
     observation_dim = int(metadata["observation_dim"])
-    if observation_dim not in (138, 150):
-        raise ValueError(f"Expected an AM Pose actor with 138 or 150 observations, got {observation_dim}.")
+    if observation_dim not in (134, 140):
+        raise ValueError(f"Expected an AM Pose actor with 134 or 140 observations, got {observation_dim}.")
     action_dim = int(metadata.get("action_dim", 4))
     if action_dim != 4:
         raise ValueError(f"Expected a four-action rotor actor, got {action_dim} actions.")
