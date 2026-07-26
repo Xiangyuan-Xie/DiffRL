@@ -36,10 +36,13 @@ class SHACConfig:
 class SHACTrainer:
     """JIT-compatible SHAC updates with gradients through MJX dynamics."""
 
-    def __init__(self, env, config: SHACConfig, seed=0):
+    def __init__(self, env, config: SHACConfig, seed=0, devices=None):
         self.env = env
         self.config = config
-        self.device_count = jax.local_device_count()
+        self.devices = tuple(jax.local_devices() if devices is None else devices)
+        if not self.devices:
+            raise ValueError("SHACTrainer requires at least one local JAX device.")
+        self.device_count = len(self.devices)
         if config.num_envs % self.device_count:
             raise ValueError(f"num_envs={config.num_envs} must be divisible by {self.device_count} local JAX devices.")
         self.envs_per_device = config.num_envs // self.device_count
@@ -63,7 +66,7 @@ class SHACTrainer:
         self.actor_optimizer_state = replicate(self.actor_optimizer.init(actor_params))
         self.critic_optimizer_state = replicate(self.critic_optimizer.init(critic_params))
         reset_keys = jax.random.split(reset_key, config.num_envs).reshape(self.device_count, self.envs_per_device, 2)
-        self.states = jax.pmap(jax.vmap(env.reset))(reset_keys)
+        self.states = jax.pmap(jax.vmap(env.reset), devices=self.devices)(reset_keys)
         self.hidden = jnp.zeros((self.device_count, 1, self.envs_per_device, config.hidden_dim))
         self.key = jax.random.split(key, self.device_count)
         self.update_index = 0
@@ -71,6 +74,7 @@ class SHACTrainer:
             horizon: jax.pmap(
                 lambda *args, horizon=horizon: self._update(*args, horizon),
                 axis_name="devices",
+                devices=self.devices,
             )
             for horizon in (16, 32)
         }
