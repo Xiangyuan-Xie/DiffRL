@@ -12,7 +12,12 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from diffrl.jax_shac.losses import actor_objective, critic_loss, polyak_update, td_lambda_returns
+from diffrl.jax_shac.losses import (
+    actor_objective,
+    critic_loss,
+    polyak_update,
+    td_lambda_returns,
+)
 from diffrl.jax_shac.models import actor_init, actor_step, critic_apply, critic_init
 
 
@@ -30,7 +35,8 @@ class SHACConfig:
     critic_iterations: int = 16
     critic_minibatches: int = 4
     target_alpha: float = 0.4
-    horizon_warmup_updates: int = 250
+    horizon: int = 128
+    gradient_horizon: int = 32
 
 
 class SHACTrainer:
@@ -39,6 +45,14 @@ class SHACTrainer:
     def __init__(self, env, config: SHACConfig, seed=0, devices=None):
         self.env = env
         self.config = config
+        if config.horizon <= 0:
+            raise ValueError(f"horizon must be positive, got {config.horizon}.")
+        if config.gradient_horizon <= 0:
+            raise ValueError(f"gradient_horizon must be positive, got {config.gradient_horizon}.")
+        if config.horizon % config.gradient_horizon:
+            raise ValueError(
+                f"horizon={config.horizon} must be divisible by gradient_horizon={config.gradient_horizon}."
+            )
         self.devices = tuple(jax.local_devices() if devices is None else devices)
         if not self.devices:
             raise ValueError("SHACTrainer requires at least one local JAX device.")
@@ -70,14 +84,11 @@ class SHACTrainer:
         self.hidden = jnp.zeros((self.device_count, 1, self.envs_per_device, config.hidden_dim))
         self.key = jax.random.split(key, self.device_count)
         self.update_index = 0
-        self._compiled_updates = {
-            horizon: jax.pmap(
-                lambda *args, horizon=horizon: self._update(*args, horizon),
-                axis_name="devices",
-                devices=self.devices,
-            )
-            for horizon in (16, 32)
-        }
+        self._compiled_update = jax.pmap(
+            lambda *args: self._update(*args, config.horizon),
+            axis_name="devices",
+            devices=self.devices,
+        )
 
     @property
     def inference_actor_params(self):
@@ -121,6 +132,34 @@ class SHACTrainer:
 
         return jax.lax.scan(rollout_step, (states, hidden), None, length=horizon)
 
+    def _chunked_actor_rollout(self, actor_params, target_critic_params, states, hidden, horizon):
+        gradient_horizon = self.config.gradient_horizon
+        chunk_count = horizon // gradient_horizon
+
+        def rollout_chunk(carry, _):
+            states, hidden = jax.tree.map(jax.lax.stop_gradient, carry)
+            (states, hidden), rollout = self._rollout(
+                actor_params,
+                states,
+                hidden,
+                gradient_horizon,
+            )
+            bootstrap = critic_apply(target_critic_params, states.obs["privileged_state"])
+            loss = actor_objective(rollout["rewards"], rollout["dones"], bootstrap, self.config.gamma)
+            return (states, hidden), (rollout, bootstrap, loss)
+
+        (states, hidden), (chunked_rollout, chunk_bootstrap, chunk_loss) = jax.lax.scan(
+            rollout_chunk,
+            (states, hidden),
+            None,
+            length=chunk_count,
+        )
+        rollout = jax.tree.map(
+            lambda value: value.reshape((horizon, *value.shape[2:])),
+            chunked_rollout,
+        )
+        return (states, hidden), rollout, chunk_bootstrap[-1], jnp.mean(chunk_loss)
+
     def _update(
         self,
         actor_params,
@@ -134,19 +173,36 @@ class SHACTrainer:
         horizon,
     ):
         def actor_loss_fn(actor_params):
-            (next_states, next_hidden), rollout = self._rollout(actor_params, states, hidden, horizon)
-            bootstrap = critic_apply(target_critic_params, next_states.obs["privileged_state"])
-            loss = actor_objective(rollout["rewards"], rollout["dones"], bootstrap, self.config.gamma)
+            (next_states, next_hidden), rollout, bootstrap, loss = self._chunked_actor_rollout(
+                actor_params,
+                target_critic_params,
+                states,
+                hidden,
+                horizon,
+            )
             return loss, (next_states, next_hidden, rollout, bootstrap)
 
         (actor_loss_value, auxiliary), gradients = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_params)
         gradients = jax.lax.pmean(gradients, axis_name="devices")
-        actor_updates, actor_optimizer_state = self.actor_optimizer.update(
-            gradients,
-            actor_optimizer_state,
-            actor_params,
+        actor_gradient_norm = optax.tree.norm(gradients)
+        actor_gradient_finite = jnp.isfinite(actor_gradient_norm) & jnp.all(
+            jnp.stack([jnp.all(jnp.isfinite(value)) for value in jax.tree.leaves(gradients)])
         )
-        actor_params = optax.apply_updates(actor_params, actor_updates)
+
+        def apply_actor_update(_):
+            actor_updates, next_optimizer_state = self.actor_optimizer.update(
+                gradients,
+                actor_optimizer_state,
+                actor_params,
+            )
+            return optax.apply_updates(actor_params, actor_updates), next_optimizer_state
+
+        actor_params, actor_optimizer_state = jax.lax.cond(
+            actor_gradient_finite,
+            apply_actor_update,
+            lambda _: (actor_params, actor_optimizer_state),
+            operand=None,
+        )
         states, hidden, rollout, bootstrap = auxiliary
         values = critic_apply(target_critic_params, rollout["observations"])
         targets = td_lambda_returns(
@@ -207,8 +263,12 @@ class SHACTrainer:
         metrics = {
             "actor_loss": jax.lax.pmean(actor_loss_value, axis_name="devices"),
             "critic_loss": jax.lax.pmean(critic_loss_value, axis_name="devices"),
-            "mean_reward": jax.lax.pmean(jnp.mean(jnp.sum(rollout["rewards"], axis=0)), axis_name="devices"),
+            "mean_reward": jax.lax.pmean(jnp.mean(rollout["rewards"]), axis_name="devices"),
+            "mean_rollout_return": jax.lax.pmean(jnp.mean(jnp.sum(rollout["rewards"], axis=0)), axis_name="devices"),
             "horizon": jnp.array(horizon),
+            "gradient_horizon": jnp.array(self.config.gradient_horizon),
+            "actor_gradient_norm": actor_gradient_norm,
+            "actor_gradient_finite": actor_gradient_finite.astype(jnp.float32),
             **{
                 name: jax.lax.pmean(jnp.mean(value), axis_name="devices")
                 for name, value in rollout.items()
@@ -228,7 +288,6 @@ class SHACTrainer:
         )
 
     def update(self):
-        horizon = 16 if self.update_index < self.config.horizon_warmup_updates else 32
         (
             self.actor_params,
             self.critic_params,
@@ -239,7 +298,7 @@ class SHACTrainer:
             self.hidden,
             self.key,
             metrics,
-        ) = self._compiled_updates[horizon](
+        ) = self._compiled_update(
             self.actor_params,
             self.critic_params,
             self.target_critic_params,

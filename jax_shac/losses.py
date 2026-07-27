@@ -29,14 +29,14 @@ def td_lambda_returns(rewards, dones, values, bootstrap_value, gamma=0.99, lambd
 
 
 def actor_objective(rewards, dones, bootstrap_value, gamma=0.99):
-    """Return the negative truncated differentiable rollout objective."""
+    """Return the per-step negative truncated differentiable rollout objective."""
     discounts = jnp.cumprod(
         jnp.concatenate((jnp.ones_like(dones[:1]), gamma * (1.0 - dones[:-1])), axis=0),
         axis=0,
     )
     rollout_return = jnp.sum(discounts * rewards, axis=0)
     terminal_discount = discounts[-1] * gamma * (1.0 - dones[-1])
-    return -jnp.mean(rollout_return + terminal_discount * bootstrap_value)
+    return -jnp.mean(rollout_return + terminal_discount * bootstrap_value) / rewards.shape[0]
 
 
 def critic_loss(predictions, targets):
