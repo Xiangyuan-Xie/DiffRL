@@ -308,5 +308,10 @@ class SHACTrainer:
             self.hidden,
             self.key,
         )
+        metrics = jax.tree.map(lambda value: value[0], metrics)
+        if not bool(metrics["actor_gradient_finite"]):
+            raise RuntimeError(
+                "SHAC actor gradients are non-finite; training stopped before applying a corrupted update."
+            )
         self.update_index += 1
-        return jax.tree.map(lambda value: value[0], metrics)
+        return metrics
