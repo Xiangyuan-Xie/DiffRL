@@ -44,7 +44,7 @@ def critic_loss(predictions, targets):
 
 
 def polyak_update(target_params, source_params, alpha=0.4):
-    """Blend source critic parameters into a target critic."""
+    """Retain ``alpha`` of the target and blend in the source critic."""
     return jax.tree_util.tree_map(
-        lambda target, source: alpha * source + (1.0 - alpha) * target, target_params, source_params
+        lambda target, source: alpha * target + (1.0 - alpha) * source, target_params, source_params
     )

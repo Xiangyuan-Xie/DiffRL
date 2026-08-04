@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from diffrl.jax_shac.checkpoint import load_actor_checkpoint
+from diffrl.jax_shac.checkpoint import load_actor_checkpoint, resolve_actor_timing_metadata
 
 
-def export_actor_onnx(checkpoint, output):
+def export_actor_onnx(checkpoint, output, *, control_dt_s=None):
     """Export a deterministic dynamic-batch actor without external tensor data."""
     import onnx
     from jax2onnx import to_onnx
@@ -15,6 +15,7 @@ def export_actor_onnx(checkpoint, output):
     from diffrl.jax_shac.models import actor_step
 
     params, metadata = load_actor_checkpoint(checkpoint)
+    metadata = resolve_actor_timing_metadata(metadata, control_dt_s)
     observation_dim = int(metadata["observation_dim"])
     if observation_dim not in (134, 140):
         raise ValueError(f"Expected an AM Pose actor with 134 or 140 observations, got {observation_dim}.")
@@ -48,6 +49,24 @@ def export_actor_onnx(checkpoint, output):
     if external_tensors:
         output.unlink(missing_ok=True)
         raise RuntimeError(f"ONNX export produced external tensor data: {external_tensors}.")
+    exported_metadata = (
+        "task",
+        "algorithm",
+        "control_dt_s",
+        "sim_dt_s",
+        "policy_rate_hz",
+        "control_dt_source",
+        "gradient_mode",
+        "gradient_model",
+        "gradient_forward_model",
+    )
+    for key in exported_metadata:
+        if key not in metadata:
+            continue
+        property_entry = model.metadata_props.add()
+        property_entry.key = key
+        property_entry.value = str(metadata[key])
+    onnx.save_model(model, output, save_as_external_data=False)
     data_path = output.with_name(output.name + ".data")
     if data_path.exists():
         data_path.unlink()
